@@ -51,15 +51,12 @@ concurrency:
 jobs:
   train:
     name: "Harbor Train (by ${{ github.actor }})"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fleet-runner]
     timeout-minutes: 4320  # 72 hours max
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install SkyPilot
-        run: pip install "skypilot-nightly[lambda,runpod]"
 
       - name: Configure Cloud Credentials
         run: |
