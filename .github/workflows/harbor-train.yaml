@@ -16,7 +16,6 @@ on:
         type: choice
         options:
           - daytona
-          - modal
         default: daytona
       run_name:
         description: "W&B run name prefix"
@@ -52,17 +51,20 @@ concurrency:
 jobs:
   train:
     name: "Harbor Train (by ${{ github.actor }})"
-    runs-on: [self-hosted, fleet-runner]
+    runs-on: ubuntu-latest
     timeout-minutes: 4320  # 72 hours max
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install SkyPilot
+        run: pip install "skypilot-nightly[lambda,runpod]"
+
       - name: Configure Cloud Credentials
         run: |
           mkdir -p ~/.lambda_cloud && echo "api_key = ${{ secrets.LAMBDA_API_KEY }}" > ~/.lambda_cloud/lambda_keys
-          pip3 install runpod 2>/dev/null || true && runpod config "${{ secrets.RUNPOD_API_KEY }}" || true
+          runpod config "${{ secrets.RUNPOD_API_KEY }}" || true
           mkdir -p ~/.config/vastai && echo "${{ secrets.VAST_API_KEY }}" > ~/.config/vastai/vast_api_key
 
       - name: Verify Cloud Credentials
@@ -116,8 +118,6 @@ jobs:
           LAUNCH_CMD="$LAUNCH_CMD --cluster ${{ steps.cluster.outputs.name }}"
           LAUNCH_CMD="$LAUNCH_CMD --env WANDB_API_KEY=$WANDB_KEY"
           LAUNCH_CMD="$LAUNCH_CMD --env DAYTONA_API_KEY=${{ secrets.DAYTONA_API_KEY }}"
-          LAUNCH_CMD="$LAUNCH_CMD --env MODAL_TOKEN_ID=${{ secrets.MODAL_TOKEN_ID }}"
-          LAUNCH_CMD="$LAUNCH_CMD --env MODAL_TOKEN_SECRET=${{ secrets.MODAL_TOKEN_SECRET }}"
           LAUNCH_CMD="$LAUNCH_CMD --env TRAIN_DATASET=${{ inputs.train_dataset }}"
           LAUNCH_CMD="$LAUNCH_CMD --env EVAL_DATASET=${{ inputs.eval_dataset }}"
           LAUNCH_CMD="$LAUNCH_CMD --env SANDBOX_PROVIDER=${{ inputs.sandbox_provider }}"
