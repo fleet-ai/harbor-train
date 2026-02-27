@@ -1,0 +1,239 @@
+name: "Harbor GRPO Training (SkyPilot)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      train_dataset:
+        description: "HuggingFace training dataset"
+        type: string
+        default: "open-thoughts/CodeContests"
+      eval_dataset:
+        description: "HuggingFace eval dataset"
+        type: string
+        default: "open-thoughts/OpenThoughts-TB-dev"
+      sandbox_provider:
+        description: "Sandbox provider for Harbor environments"
+        type: choice
+        options:
+          - daytona
+          - modal
+        default: daytona
+      run_name:
+        description: "W&B run name prefix"
+        type: string
+        default: "harbor-codecontest"
+      cloud:
+        description: "Preferred cloud (any = auto-select cheapest)"
+        type: choice
+        options:
+          - any
+          - lambda
+          - runpod
+          - vast
+        default: any
+      task_name:
+        description: "SkyPilot task YAML (in skyrl-train/tasks/)"
+        type: choice
+        options:
+          - harbor-grpo-qwen3-8b
+        default: "harbor-grpo-qwen3-8b"
+      disable_slack:
+        description: "Disable Slack notifications (for debugging)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harbor-training-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: "Harbor Train (by ${{ github.actor }})"
+    runs-on: [self-hosted, fleet-runner]
+    timeout-minutes: 4320  # 72 hours max
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Cloud Credentials
+        run: |
+          mkdir -p ~/.lambda_cloud && echo "api_key = ${{ secrets.LAMBDA_API_KEY }}" > ~/.lambda_cloud/lambda_keys
+          pip3 install runpod 2>/dev/null || true && runpod config "${{ secrets.RUNPOD_API_KEY }}" || true
+          mkdir -p ~/.config/vastai && echo "${{ secrets.VAST_API_KEY }}" > ~/.config/vastai/vast_api_key
+
+      - name: Verify Cloud Credentials
+        run: sky check lambda runpod vast || true
+
+      - name: Generate Cluster Name
+        id: cluster
+        run: |
+          TIMESTAMP=$(date -u +"%Y%m%d-%H%M")
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          CLUSTER_NAME="harbor-${SHORT_SHA}-${TIMESTAMP}"
+          CLUSTER_NAME=$(echo "$CLUSTER_NAME" | tr '_' '-' | tr '[:upper:]' '[:lower:]')
+          echo "name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+          RUN_ID=$(head -c 4 /dev/urandom | xxd -p)
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Notify Slack - Starting
+        if: ${{ inputs.disable_slack != true }}
+        id: slack_start
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#fleet-training-runs",
+              "text": "🚀 Harbor Training Started",
+              "blocks": [
+                { "type": "header", "text": { "type": "plain_text", "text": "🚀 Harbor Training Started" } },
+                { "type": "section", "fields": [
+                  { "type": "mrkdwn", "text": "*Cluster:*\n`${{ steps.cluster.outputs.name }}`" },
+                  { "type": "mrkdwn", "text": "*Task:*\n`${{ inputs.task_name }}`" },
+                  { "type": "mrkdwn", "text": "*Train Data:*\n`${{ inputs.train_dataset }}`" },
+                  { "type": "mrkdwn", "text": "*Sandbox:*\n`${{ inputs.sandbox_provider }}`" }
+                ]},
+                { "type": "context", "elements": [
+                  { "type": "mrkdwn", "text": "Triggered by: ${{ github.actor }} | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow> | <https://wandb.ai/thefleet/harbor|WandB>" }
+                ]}
+              ]
+            }
+
+      - name: Launch Training Cluster
+        id: launch
+        run: |
+          WANDB_KEY="${{ secrets.WANDB_API_SWE_KEY }}"
+          [ -z "$WANDB_KEY" ] && echo "ERROR: WANDB_API_SWE_KEY not set" && exit 1
+
+          RUN_NAME="${{ inputs.run_name }}-${{ steps.cluster.outputs.run_id }}"
+
+          LAUNCH_CMD="sky launch skyrl-train/tasks/${{ inputs.task_name }}.yaml"
+          LAUNCH_CMD="$LAUNCH_CMD --cluster ${{ steps.cluster.outputs.name }}"
+          LAUNCH_CMD="$LAUNCH_CMD --env WANDB_API_KEY=$WANDB_KEY"
+          LAUNCH_CMD="$LAUNCH_CMD --env DAYTONA_API_KEY=${{ secrets.DAYTONA_API_KEY }}"
+          LAUNCH_CMD="$LAUNCH_CMD --env MODAL_TOKEN_ID=${{ secrets.MODAL_TOKEN_ID }}"
+          LAUNCH_CMD="$LAUNCH_CMD --env MODAL_TOKEN_SECRET=${{ secrets.MODAL_TOKEN_SECRET }}"
+          LAUNCH_CMD="$LAUNCH_CMD --env TRAIN_DATASET=${{ inputs.train_dataset }}"
+          LAUNCH_CMD="$LAUNCH_CMD --env EVAL_DATASET=${{ inputs.eval_dataset }}"
+          LAUNCH_CMD="$LAUNCH_CMD --env SANDBOX_PROVIDER=${{ inputs.sandbox_provider }}"
+          LAUNCH_CMD="$LAUNCH_CMD --env RUN_NAME=$RUN_NAME"
+          LAUNCH_CMD="$LAUNCH_CMD -y"
+
+          echo "Command: $LAUNCH_CMD"
+
+          # Retry logic: 4 attempts with 2-4-8 minute intervals
+          MAX_ATTEMPTS=4
+          RETRY_DELAYS=(120 240 480)
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "=== Attempt $attempt of $MAX_ATTEMPTS ==="
+            if eval "$LAUNCH_CMD"; then
+              echo "status=SUCCEEDED" >> $GITHUB_OUTPUT
+              echo "attempts=$attempt" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            if [ $attempt -lt $MAX_ATTEMPTS ]; then
+              echo "Attempt $attempt failed. Cleaning up before retry..."
+              sky down "${{ steps.cluster.outputs.name }}" -y || true
+
+              DELAY=${RETRY_DELAYS[$((attempt-1))]}
+              echo "Waiting $((DELAY/60)) minutes before retry..."
+              sleep $DELAY
+            fi
+          done
+
+          echo "All $MAX_ATTEMPTS provisioning attempts failed"
+          echo "status=FAILED" >> $GITHUB_OUTPUT
+          echo "attempts=$MAX_ATTEMPTS" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Cleanup Cluster
+        if: always()
+        run: |
+          echo "Cleaning up cluster ${{ steps.cluster.outputs.name }}..."
+          sky down "${{ steps.cluster.outputs.name }}" -y || true
+
+      - name: Notify Slack - Completed
+        if: steps.launch.outputs.status == 'SUCCEEDED' && inputs.disable_slack != true
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#fleet-training-runs",
+              "thread_ts": "${{ steps.slack_start.outputs.ts }}",
+              "text": "✅ Harbor Training Completed",
+              "blocks": [
+                { "type": "header", "text": { "type": "plain_text", "text": "✅ Harbor Training Completed" } },
+                { "type": "section", "fields": [
+                  { "type": "mrkdwn", "text": "*Cluster:*\n`${{ steps.cluster.outputs.name }}`" },
+                  { "type": "mrkdwn", "text": "*Status:*\n`SUCCEEDED`" }
+                ]},
+                { "type": "section", "text": { "type": "mrkdwn", "text": "<https://wandb.ai/thefleet/harbor|View Results on WandB>" } }
+              ]
+            }
+
+      - name: Notify Slack - Failed
+        if: failure() && inputs.disable_slack != true
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#fleet-training-runs",
+              "thread_ts": "${{ steps.slack_start.outputs.ts }}",
+              "text": "❌ Harbor Training Failed",
+              "blocks": [
+                { "type": "header", "text": { "type": "plain_text", "text": "❌ Harbor Training Failed" } },
+                { "type": "section", "fields": [
+                  { "type": "mrkdwn", "text": "*Cluster:*\n`${{ steps.cluster.outputs.name }}`" },
+                  { "type": "mrkdwn", "text": "*Status:*\n`FAILED`" }
+                ]},
+                { "type": "section", "text": { "type": "mrkdwn", "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>" } }
+              ]
+            }
+
+      - name: Notify Slack - Cancelled
+        if: cancelled() && inputs.disable_slack != true
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#fleet-training-runs",
+              "thread_ts": "${{ steps.slack_start.outputs.ts }}",
+              "text": "⚠️ Harbor Training Cancelled",
+              "blocks": [
+                { "type": "header", "text": { "type": "plain_text", "text": "⚠️ Harbor Training Cancelled" } },
+                { "type": "section", "fields": [
+                  { "type": "mrkdwn", "text": "*Cluster:*\n`${{ steps.cluster.outputs.name }}`" },
+                  { "type": "mrkdwn", "text": "*Status:*\n`CANCELLED`" }
+                ]},
+                { "type": "context", "elements": [
+                  { "type": "mrkdwn", "text": "Cancelled by user or superseded by new run" }
+                ]}
+              ]
+            }
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Harbor Training Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | \`${{ steps.cluster.outputs.name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Task | \`${{ inputs.task_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Train Dataset | \`${{ inputs.train_dataset }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Eval Dataset | \`${{ inputs.eval_dataset }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sandbox | \`${{ inputs.sandbox_provider }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | \`${{ steps.launch.outputs.status || 'FAILED' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Attempts | \`${{ steps.launch.outputs.attempts || '?' }}\` |" >> $GITHUB_STEP_SUMMARY
